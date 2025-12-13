@@ -1,8 +1,6 @@
 fastapi
 uvicorn
-rembg
 pillow
 pypdf
 pymupdf
 python-multipart
-onnxruntime
