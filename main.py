@@ -11,7 +11,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        # "https://yourfrontend.com",
+        "https://pixeldrift-one.vercel.app/",
+        "https://pixeldrift-one.vercel.app"
     ],
     allow_credentials=False,
     allow_methods=["*"],
