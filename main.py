@@ -22,4 +22,11 @@ app.add_middleware(
 # Register routes
 app.include_router(pdf_router, prefix="/pdf", tags=["PDF Tools"])
 app.include_router(image_router, prefix="/image", tags=["Image Tools"])
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "message": "Backend is awake"
+    }
+
 

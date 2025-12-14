@@ -1,6 +1,6 @@
 from fastapi import APIRouter, UploadFile, File, Query, HTTPException, Form
 from fastapi.responses import StreamingResponse
-from PIL import Image, ImageEnhance, UnidentifiedImageError
+from PIL import Image, ImageEnhance, UnidentifiedImageError, ImageOps
 import io
 from io import BytesIO
 import zipfile
@@ -11,95 +11,139 @@ import typing
 router = APIRouter()
 
 
+# ------------------ CONFIG ------------------
+
+MAX_IMAGE_SIZE = 15 * 1024 * 1024  # 15MB
+SUPPORTED_FORMATS = {"jpeg", "jpg", "png", "webp"}
+
+# ------------------ HELPERS ------------------
+
+def sanitize_filename(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]", "_", name)
+
+
+def calculate_new_size(
+    image: Image.Image,
+    resize_percent: int,
+    max_width: int | None,
+    max_height: int | None,
+):
+    w, h = image.size
+    scale = resize_percent / 100
+
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    if max_width and new_w > max_width:
+        ratio = max_width / new_w
+        new_w = max_width
+        new_h = int(new_h * ratio)
+
+    if max_height and new_h > max_height:
+        ratio = max_height / new_h
+        new_h = max_height
+        new_w = int(new_w * ratio)
+
+    return new_w, new_h
+
+
+# ------------------ ROUTE ------------------
+
 @router.post("/compress-image-advanced")
 async def compress_image_advanced(
     file: UploadFile = File(...),
 
-    # Quality control
     quality: int = Query(75, ge=1, le=100),
-
-    # Resize control (percentage)
     resize_percent: int = Query(100, ge=10, le=100),
-
-    # Max dimension control
     max_width: int | None = Query(None, ge=100),
     max_height: int | None = Query(None, ge=100),
-
-    # Output format
-    format: str = Query("jpeg", regex="^(jpeg|jpg|png|webp)$"),
-
-    # Metadata control
+    format: str = Query("jpeg"),
     keep_metadata: bool = Query(False),
 ):
     """
-    Full-featured image compressor:
-    - Quality (1–100)
+    Advanced Image Compression API
+    - Quality control
     - Resize percentage
-    - Max width/height resizing
+    - Max width / height
     - Format conversion
-    - Remove EXIF metadata
+    - Metadata removal
     """
 
-    # Read file
-    original_bytes = await file.read()
-    image = Image.open(io.BytesIO(original_bytes))
+    format = format.lower()
+    if format not in SUPPORTED_FORMATS:
+        raise HTTPException(400, "Unsupported output format")
 
-    # Auto-convert transparency if needed
+    # -------- READ & VALIDATE FILE --------
+    original_bytes = await file.read()
+
+    if not original_bytes:
+        raise HTTPException(400, "Empty file")
+
+    if len(original_bytes) > MAX_IMAGE_SIZE:
+        raise HTTPException(413, "Image too large (max 15MB)")
+
+    try:
+        image = Image.open(io.BytesIO(original_bytes))
+    except Exception:
+        raise HTTPException(400, "Invalid image file")
+
+    # -------- FIX ORIENTATION --------
+    image = ImageOps.exif_transpose(image)
+
+    # -------- MODE CONVERSION --------
     if image.mode in ("RGBA", "P"):
         image = image.convert("RGB")
 
-    # ----- STEP 1: Resize by percentage -----
-    if resize_percent < 100:
-        new_w = int(image.width * resize_percent / 100)
-        new_h = int(image.height * resize_percent / 100)
-        image = image.resize((new_w, new_h), Image.LANCZOS)
-
-    # ----- STEP 2: Check max width/height -----
-    if max_width or max_height:
-        ratio = image.width / image.height
-
-        if max_width and image.width > max_width:
-            new_w = max_width
-            new_h = int(max_width / ratio)
-            image = image.resize((new_w, new_h), Image.LANCZOS)
-
-        if max_height and image.height > max_height:
-            new_h = max_height
-            new_w = int(max_height * ratio)
-            image = image.resize((new_w, new_h), Image.LANCZOS)
-
-    # ----- STEP 3: Save with compression -----
-    buffer = io.BytesIO()
-
-    save_params = {
-        "format": format.upper(),
-        "optimize": True,
-    }
-
-    # JPEG/WebP compression control
-    if format.lower() in ["jpeg", "jpg", "webp"]:
-        save_params["quality"] = quality
-
-    # Remove metadata unless required
-    if not keep_metadata:
-        image.info.pop("exif", None)
-
-    image.save(buffer, **save_params)
-    buffer.seek(0)
-
-    # Determine filename
-    ext = format.lower()
-    filename = f"compressed.{ext}"
-
-    return StreamingResponse(
-        buffer,
-        media_type=f"image/{ext}",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    # -------- RESIZE (SINGLE PASS) --------
+    new_size = calculate_new_size(
+        image, resize_percent, max_width, max_height
     )
 
+    if new_size != image.size:
+        image = image.resize(new_size, Image.LANCZOS)
 
-#########  Converter
+    # -------- METADATA --------
+    if not keep_metadata:
+        image.info.clear()
 
+    # -------- SAVE OPTIMIZED --------
+    buffer = io.BytesIO()
+
+    save_params: dict = {"optimize": True}
+
+    if format in ("jpeg", "jpg", "webp"):
+        save_params["quality"] = quality
+        save_params["subsampling"] = 2
+
+    if format == "png":
+        save_params["compress_level"] = 9
+
+    pil_format = "JPEG" if format in ("jpeg", "jpg") else format.upper()
+
+    image.save(buffer, format=pil_format, **save_params)
+    buffer.seek(0)
+
+    output_bytes = buffer.getvalue()
+    buffer.seek(0)
+
+    filename = sanitize_filename(f"compressed.{format}")
+
+    # -------- STREAM WITH CONTENT-LENGTH (PROGRESS BAR WORKS) --------
+    return StreamingResponse(
+        buffer,
+        media_type=f"image/{format}",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(output_bytes)),
+            "Cache-Control": "no-store",
+        },
+    )
+
+######################## COnvert Image
+
+# ---------------- CONFIG ----------------
+
+MAX_IMAGE_SIZE = 15 * 1024 * 1024  # 15MB
 
 SUPPORTED_OUTPUTS = {
     "jpeg": "JPEG",
@@ -110,87 +154,107 @@ SUPPORTED_OUTPUTS = {
     "tiff": "TIFF",
 }
 
+# ---------------- HELPERS ----------------
 
 def sanitize_filename(name: str) -> str:
-    """Remove unsafe characters from filenames."""
-    return re.sub(r"[^a-zA-Z0-9_\-\.]", "_", name)
+    return re.sub(r"[^a-zA-Z0-9_.-]", "_", name)
 
+
+def load_image(file: UploadFile) -> Image.Image:
+    data = file.file.read()
+    if len(data) > MAX_IMAGE_SIZE:
+        raise HTTPException(413, "Image too large")
+
+    try:
+        img = Image.open(BytesIO(data))
+        img = ImageOps.exif_transpose(img)
+        return img
+    except Exception:
+        raise HTTPException(400, f"Invalid image: {file.filename}")
+
+
+def prepare_image(img: Image.Image, out_format: str) -> Image.Image:
+    if img.mode in ("RGBA", "P") and out_format in ("jpeg", "jpg", "bmp"):
+        return img.convert("RGB")
+    return img
+
+
+# ---------------- ROUTE ----------------
 
 @router.post("/convert-image")
 async def convert_image(
     files: list[UploadFile] = File(...),
-    out_format: str = Form(...),              # "jpg" | "png" | "webp" | etc.
-    rename_to: str = Form(None),              # Optional rename ("my-photo")
+    out_format: str = Form(...),
+    rename_to: str | None = Form(None),
 ):
-    if out_format.lower() not in SUPPORTED_OUTPUTS:
-        return {"error": "Unsupported output format."}
+    out_format = out_format.lower()
 
-    output_ext = out_format.lower()
-    pil_format = SUPPORTED_OUTPUTS[output_ext]
+    if out_format not in SUPPORTED_OUTPUTS:
+        raise HTTPException(400, "Unsupported output format")
 
-    # Single file conversion
+    pil_format = SUPPORTED_OUTPUTS[out_format]
+
+    # -------- SINGLE FILE --------
     if len(files) == 1:
         file = files[0]
-        content = await file.read()
-        img = Image.open(BytesIO(content))
-
-        # Convert transparent images properly
-        if img.mode in ("RGBA", "P") and pil_format == "JPEG":
-            img = img.convert("RGB")
+        img = prepare_image(load_image(file), out_format)
 
         buffer = BytesIO()
-        img.save(buffer, pil_format)
+        img.save(buffer, pil_format, optimize=True)
         buffer.seek(0)
 
-        # Handle renaming
-        if rename_to:
-            filename = f"{sanitize_filename(rename_to)}.{output_ext}"
-        else:
-            base = file.filename.rsplit(".", 1)[0]
-            filename = f"{sanitize_filename(base)}_converted.{output_ext}"
+        base = rename_to or file.filename.rsplit(".", 1)[0]
+        filename = f"{sanitize_filename(base)}.{out_format}"
 
         return StreamingResponse(
             buffer,
-            media_type=f"image/{output_ext}",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
+            media_type=f"image/{out_format}",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(len(buffer.getvalue())),
+                "Cache-Control": "no-store",
+            },
         )
 
-    # Multi-file: return ZIP
+    # -------- MULTI FILE → ZIP --------
     zip_buffer = BytesIO()
 
-    with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for index, file in enumerate(files, start=1):
-            content = await file.read()
-            img = Image.open(BytesIO(content))
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for idx, file in enumerate(files, start=1):
+            img = prepare_image(load_image(file), out_format)
 
-            # Convert mode correctly
-            if img.mode in ("RGBA", "P") and pil_format == "JPEG":
-                img = img.convert("RGB")
+            img_buffer = BytesIO()
+            img.save(img_buffer, pil_format, optimize=True)
 
-            buffer = BytesIO()
-            img.save(buffer, pil_format)
-            buffer.seek(0)
+            base = rename_to or file.filename.rsplit(".", 1)[0]
+            name = f"{sanitize_filename(base)}_{idx}.{out_format}"
 
-            # Naming logic
-            if rename_to:
-                filename = f"{sanitize_filename(rename_to)}_{index}.{output_ext}"
-            else:
-                base = file.filename.rsplit(".", 1)[0]
-                filename = f"{sanitize_filename(base)}_converted.{output_ext}"
-
-            zf.writestr(filename, buffer.getvalue())
+            zipf.writestr(name, img_buffer.getvalue())
 
     zip_buffer.seek(0)
 
     return StreamingResponse(
         zip_buffer,
         media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename=converted_images.zip"}
+        headers={
+            "Content-Disposition": 'attachment; filename="converted_images.zip"',
+            "Content-Length": str(len(zip_buffer.getvalue())),
+            "Cache-Control": "no-store",
+        },
     )
 
 
+#####################3 Resize image
 
-########## Resize image
+
+
+
+
+
+
+# ---------------- CONFIG ----------------
+
+MAX_IMAGE_SIZE = 15 * 1024 * 1024  # 15MB
 
 FORMAT_MAP = {
     "jpeg": ("JPEG", "image/jpeg", "jpg"),
@@ -198,143 +262,138 @@ FORMAT_MAP = {
     "webp": ("WEBP", "image/webp", "webp"),
 }
 
+# ---------------- HELPERS ----------------
 
-def open_image_safely(data: bytes) -> Image.Image:
-    img = Image.open(BytesIO(data))
-    # Convert palette/rgba to RGB for safe saving as JPEG
-    if img.mode in ("P", "LA", "RGBA"):
-        img = img.convert("RGBA") if img.mode == "RGBA" else img.convert("RGB")
-    return img
+def sanitize_filename(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]", "_", name)
 
+
+def open_image(data: bytes) -> Image.Image:
+    if len(data) > MAX_IMAGE_SIZE:
+        raise HTTPException(413, "Image too large")
+
+    try:
+        img = Image.open(BytesIO(data))
+        return ImageOps.exif_transpose(img)
+    except UnidentifiedImageError:
+        raise HTTPException(400, "Invalid image")
+
+
+def compute_size(
+    ow: int,
+    oh: int,
+    tw: int,
+    th: int,
+    mode: str,
+):
+    if mode == "stretch":
+        return tw, th
+
+    r = ow / oh
+    if tw / th > r:
+        nh = th
+        nw = int(th * r)
+    else:
+        nw = tw
+        nh = int(tw / r)
+
+    return nw, nh
+
+
+# ---------------- ROUTE ----------------
 
 @router.post("/resize-image")
-async def resize_image_new(
+async def resize_image(
     files: typing.List[UploadFile] = File(...),
 
-    width: int | None = Form(None),
-    height: int | None = Form(None),
-    percentage: int | None = Form(None),
+    width: int = Form(...),
+    height: int = Form(...),
 
-    keep_ratio: bool = Form(True),
-    prevent_upscale: bool = Form(True),
+    resize_mode: str = Form("fit"),   # fit | stretch | pad
+    bg_color: str = Form("#ffffff"),
 
     out_format: str = Form("jpeg"),
     quality: int = Form(85),
     sharpen: float = Form(1.0),
 ):
-    """
-    Fixed version:
-    - Correct handling for None/empty values
-    - Accepts Form() not Query()
-    """
-
     if not files:
-        raise HTTPException(400, "No files uploaded.")
+        raise HTTPException(400, "No files uploaded")
 
-    key = out_format.lower()
-    if key not in FORMAT_MAP:
+    if resize_mode not in {"fit", "stretch", "pad"}:
+        raise HTTPException(400, "Invalid resize mode")
+
+    fmt_key = out_format.lower()
+    if fmt_key not in FORMAT_MAP:
         raise HTTPException(400, "Unsupported output format")
 
-    pillow_fmt, mime_type, ext = FORMAT_MAP[key]
-
-    results = []
+    pillow_fmt, mime, ext = FORMAT_MAP[fmt_key]
+    results: list[tuple[str, BytesIO]] = []
 
     for upload in files:
-        content = await upload.read()
+        data = await upload.read()
+        img = open_image(data)
 
-        try:
-            img = open_image_safely(content)
-        except UnidentifiedImageError:
-            raise HTTPException(400, f"Unsupported or corrupted image: {upload.filename}")
+        ow, oh = img.size
+        rw, rh = compute_size(ow, oh, width, height, resize_mode)
 
-        orig_w, orig_h = img.size
+        resized = img.resize((rw, rh), Image.LANCZOS)
 
-        # -------------------------------
-        # FIXED: SIZE COMPUTATION LOGIC
-        # -------------------------------
-        if percentage is not None:
-            new_w = max(1, int(orig_w * percentage / 100))
-            new_h = max(1, int(orig_h * percentage / 100))
+        if sharpen > 1:
+            resized = ImageEnhance.Sharpness(resized).enhance(sharpen)
 
-        elif width is not None and height is None:
-            if keep_ratio:
-                r = width / orig_w
-                new_w = width
-                new_h = int(orig_h * r)
+        # PAD MODE
+        if resize_mode == "pad":
+            if bg_color == "transparent" and pillow_fmt != "JPEG":
+                canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
             else:
-                new_w = width
-                new_h = orig_h
+                canvas = Image.new("RGB", (width, height), bg_color)
 
-        elif height is not None and width is None:
-            if keep_ratio:
-                r = height / orig_h
-                new_h = height
-                new_w = int(orig_w * r)
-            else:
-                new_h = height
-                new_w = orig_w
+            x = (width - rw) // 2
+            y = (height - rh) // 2
+            canvas.paste(resized, (x, y))
+            resized = canvas
 
-        elif width is not None and height is not None:
-            if keep_ratio:
-                r = min(width / orig_w, height / orig_h)
-                new_w = int(orig_w * r)
-                new_h = int(orig_h * r)
-            else:
-                new_w = width
-                new_h = height
+        # JPEG safety
+        if pillow_fmt == "JPEG" and resized.mode in ("RGBA", "LA"):
+            resized = resized.convert("RGB")
 
-        else:
-            raise HTTPException(400, "Provide width, height, or percentage.")
-
-        # Prevent upscaling
-        if prevent_upscale:
-            new_w = min(new_w, orig_w)
-            new_h = min(new_h, orig_h)
-
-        # Resize
-        img_resized = img.resize((new_w, new_h), Image.LANCZOS)
-
-        # Sharpen
-        if sharpen != 1.0 and sharpen > 0:
-            enhancer = ImageEnhance.Sharpness(img_resized)
-            img_resized = enhancer.enhance(sharpen)
-
-        # Convert for JPEG
-        if pillow_fmt == "JPEG" and img_resized.mode in ("RGBA", "LA"):
-            img_resized = img_resized.convert("RGB")
-
-        # Output buffer
         buf = BytesIO()
-        save_kwargs = {}
-        if pillow_fmt in ("JPEG", "WEBP"):
-            save_kwargs["quality"] = quality
-            if pillow_fmt == "JPEG":
-                save_kwargs["optimize"] = True
+        save_args = {"optimize": True}
 
-        img_resized.save(buf, format=pillow_fmt, **save_kwargs)
+        if pillow_fmt in ("JPEG", "WEBP"):
+            save_args["quality"] = quality
+
+        resized.save(buf, pillow_fmt, **save_args)
         buf.seek(0)
 
         base = upload.filename.rsplit(".", 1)[0]
-        results.append((f"{base}-resized.{ext}", buf))
+        results.append((f"{sanitize_filename(base)}-resized.{ext}", buf))
 
-    # 1 file → direct download
+    # SINGLE
     if len(results) == 1:
         fn, buf = results[0]
         return StreamingResponse(
             buf,
-            media_type=mime_type,
-            headers={"Content-Disposition": f'attachment; filename="{fn}"'}
+            media_type=mime,
+            headers={
+                "Content-Disposition": f'attachment; filename="{fn}"',
+                "Content-Length": str(len(buf.getvalue())),
+            },
         )
 
-    # Multiple → ZIP
+    # ZIP
     zip_buf = BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
         for fn, buf in results:
             z.writestr(fn, buf.getvalue())
-    zip_buf.seek(0)
 
+    zip_buf.seek(0)
     return StreamingResponse(
         zip_buf,
         media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="resized-images.zip"'}
+        headers={
+            "Content-Disposition": 'attachment; filename="resized-images.zip"',
+            "Content-Length": str(len(zip_buf.getvalue())),
+        },
     )
+
